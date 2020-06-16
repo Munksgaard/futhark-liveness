@@ -7,88 +7,62 @@ import Control.Monad.IO.Class
 import Data.Foldable
 import qualified Data.Set as Set
 import Data.Set (Set)
-import Futhark.IR.KernelsMem (KernelsMem, MemOp (..), Prog (..), typeOf)
+import Futhark.IR.KernelsMem (KernelsMem, MemOp (..), Prog (..), freeIn, typeOf)
+import Futhark.IR.Prop.Names (Names, boundByStm, boundInBody, namesFromList, namesSubtract)
 import Futhark.IR.Syntax
 import Futhark.Pass
 import Futhark.Pipeline
 
-genSubExp :: SubExp -> Set VName
-genSubExp (Var vname) = Set.singleton vname
-genSubExp (Constant _) = Set.empty
-
-genBop :: BasicOp -> Set VName
-genBop (SubExp sexp) = genSubExp sexp
-genBop (Opaque sexp) =
-  -- TODO: Is this wrong? It's opaque, so perhaps it should not be included
-  -- here?
-  genSubExp sexp
-genBop (ArrayLit sexps _) = Set.unions $ fmap genSubExp sexps
-genBop (UnOp _ sexp) = genSubExp sexp
-genBop (BinOp _ sexp1 sexp2) = genSubExp sexp1 `Set.union` genSubExp sexp2
-genBop (CmpOp _ sexp1 sexp2) = genSubExp sexp1 `Set.union` genSubExp sexp2
-genBop (ConvOp _ sexp) = genSubExp sexp
-genBop (Assert sexp _ _) = genSubExp sexp
-genBop (Index vname slice) =
-  Set.singleton vname
-    `Set.union` foldMap (foldMap genSubExp) slice
-genBop (Update vname slice sexp) =
-  Set.singleton vname
-    `Set.union` foldMap (foldMap genSubExp) slice
-    `Set.union` genSubExp sexp
-genBop (Concat _ vname vnames sexp) =
-  Set.singleton vname
-    `Set.union` Set.fromList vnames
-    `Set.union` genSubExp sexp
-genBop (Copy vname) = Set.singleton vname
-genBop (Manifest _ vname) = Set.singleton vname
-genBop (Iota sexp1 sexp2 sexp3 _) =
-  Set.unions $ fmap genSubExp [sexp1, sexp2, sexp3]
-genBop (Replicate shape sexp) =
-  genSubExp sexp
-    `Set.union` foldMap genSubExp (shapeDims shape)
-genBop (Scratch _ sexps) = foldMap genSubExp sexps
-genBop (Reshape shape_change vname) =
-  Set.singleton vname
-    `Set.union` foldMap (foldMap genSubExp) shape_change
-genBop (Rearrange _ vname) = Set.singleton vname
-genBop (Rotate sexps vname) =
-  Set.singleton vname
-    `Set.union` foldMap genSubExp sexps
-
-genBody :: Body KernelsMem -> Set VName
-genBody Body {bodyStms, bodyResult} =
-  foldMap gen bodyStms
-    `Set.union` foldMap genSubExp bodyResult
-
-genLoopForm :: LoopForm KernelsMem -> Set VName
-genLoopForm (ForLoop vname _ sexp params) =
-  Set.singleton vname
-    `Set.union` genSubExp sexp
-    `Set.union` foldMap (Set.singleton . snd) params
-
-genExp :: Exp KernelsMem -> Set VName
-genExp (BasicOp bop) = genBop bop
-genExp (Apply _ sexps_and_diets _ _) = foldMap (genSubExp . fst) sexps_and_diets
-genExp (If sexp then_body else_body _) =
-  genSubExp sexp
-    `Set.union` genBody then_body
-    `Set.union` genBody else_body
-genExp (DoLoop ctx vals form body) =
-  genBody body
-    `Set.union` foldMap (genSubExp . snd) ctx
-    `Set.union` foldMap (genSubExp . snd) vals
-genExp (Op (Alloc sexp _)) = genSubExp sexp
-genExp (Op (Inner _)) = Set.empty -- TODO
-
-gen :: Stm KernelsMem -> Set VName
+gen :: Stm KernelsMem -> Names
 gen stm@(Let {stmExp}) =
-  genExp stmExp
+  freeIn stmExp
 
-kill :: Stm KernelsMem -> Set VName
-kill Let {stmPattern} =
-  Set.union
-    (Set.fromList $ fmap patElemName $ patternContextElements stmPattern)
-    (Set.fromList $ fmap patElemName $ patternValueElements stmPattern)
+kill :: Stm KernelsMem -> Names
+kill stm@Let {stmPattern} =
+  freeIn stmPattern <> boundByStm stm
+
+inOut :: (Stm KernelsMem, (Names, Names)) -> (Names, Names) -> (Names, Names)
+inOut (stm@Let {stmPattern, stmExp = If cond then_branch else_branch ifdec}, (i, o)) (i_prev, o_prev) =
+  let (_, then_liveness) = unzip $ liveness then_branch
+      (_, else_liveness) = unzip $ liveness else_branch
+      branch_outs = (fst $ head then_liveness) <> (fst $ head else_liveness)
+      i' = freeIn cond <> (branch_outs `namesSubtract` (freeIn stmPattern <> boundByStm stm))
+      o' = o <> i_prev
+   in (i', o')
+inOut (stm@Let {stmPattern, stmExp = DoLoop ctx vals form body}, (i, o)) (i_prev, o_prev) =
+  let (_, body_liveness) = unzip $ liveness body
+      body_outs = (fst $ head body_liveness)
+      i' =
+        freeIn (map snd ctx)
+          <> freeIn (map snd vals)
+          <> ( body_outs
+                 `namesSubtract` ( freeIn stmPattern
+                                     <> boundByStm stm
+                                     <> freeIn (map fst vals)
+                                     <> freeIn (map fst ctx)
+                                     <> namesFromList (map (paramName . fst) (ctx <> vals))
+                                 )
+             )
+      o' = o <> i_prev
+   in (i', o')
+inOut (stm@Let {stmPattern, stmExp = BasicOp bop}, (i, o)) (i_prev, o_prev) =
+  let o' = o <> i_prev
+      i' = gen stm <> (o' `namesSubtract` kill stm)
+   in (i', o')
+inOut (stm@Let {stmPattern, stmExp = Apply name args rets aux}, (i, o)) (i_prev, o_prev) =
+  let o' = o <> i_prev
+      i' = gen stm <> (o' `namesSubtract` kill stm)
+   in (i', o')
+inOut (stm, (i, o)) (i_prev, o_prev) =
+  let o' = o <> i_prev
+      i' = gen stm <> (o' `namesSubtract` kill stm)
+   in (i', o')
+
+liveness :: Body KernelsMem -> [(Stm KernelsMem, (Names, Names))]
+liveness Body {bodyStms, bodyResult} =
+  fix (zip (toList bodyStms) . scanr inOut (mempty, mempty)) $
+    zip (toList bodyStms) $
+      zip (repeat mempty) (replicate (length bodyStms - 1) mempty ++ [freeIn bodyResult])
 
 livenessStm :: Stm KernelsMem -> FutharkM ()
 livenessStm (Let {stmPattern, stmAux, stmExp}) =
@@ -100,7 +74,7 @@ livenessFun
     { funDefEntryPoint,
       funDefName,
       funDefParams,
-      funDefBody = Body {bodyDec, bodyStms, bodyResult}
+      funDefBody = body@Body {bodyDec, bodyStms, bodyResult}
     } = do
     liftIO $ putStrLn $ "Analyzing " ++ show funDefName
     liftIO $
@@ -113,7 +87,17 @@ livenessFun
             "\nBodyResult:",
             show bodyResult
           ]
-    liftIO $ putStrLn $ unlines $ toList $ fmap (\stm -> pretty stm ++ "   : gen=" ++ pretty (gen stm)) bodyStms
+    liftIO $
+      putStrLn $
+        unlines $
+          toList $
+            fmap (\(stm, (i, o)) -> pretty stm ++ "   : gen=" ++ pretty (gen stm) ++ ", kill=" ++ pretty (kill stm) ++ ", in=" ++ pretty i ++ ", out=" ++ pretty o) $
+              liveness body
+
+fix :: Eq a => (a -> a) -> a -> a
+fix f x =
+  let x' = f x
+   in if x' == x then x else fix f x'
 
 livenessProg :: Prog KernelsMem -> FutharkM ()
 livenessProg (Prog _ funs) = mapM_ livenessFun funs
